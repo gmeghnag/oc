@@ -48,7 +48,6 @@ var (
   interfaces:
   - name: eth0
     macAddress: 00:b9:9b:c8:ac:f4`
-	defaultOutputName = "node.iso"
 )
 
 func TestValidate(t *testing.T) {
@@ -61,7 +60,6 @@ func TestValidate(t *testing.T) {
 		{
 			name:        "default",
 			nodesConfig: &defaultNodesConfigYaml,
-			outputName:  &defaultOutputName,
 		},
 		{
 			name:          "missing configuration file",
@@ -70,14 +68,7 @@ func TestValidate(t *testing.T) {
 		{
 			name:          "invalid configuration file",
 			nodesConfig:   strPtr("invalid: yaml\n\tfile"),
-			outputName:    &defaultOutputName,
 			expectedError: "config file nodes-config.yaml is not valid",
-		},
-		{
-			name:          "invalid output name",
-			nodesConfig:   &defaultNodesConfigYaml,
-			outputName:    strPtr(""),
-			expectedError: "--output-name cannot be empty",
 		},
 	}
 	for _, tc := range testCases {
@@ -90,9 +81,6 @@ func TestValidate(t *testing.T) {
 			}
 			o := &CreateOptions{
 				FSys: fakeFileSystem,
-			}
-			if tc.outputName != nil {
-				o.OutputName = *tc.outputName
 			}
 
 			err := o.Validate()
@@ -130,26 +118,18 @@ func TestRun(t *testing.T) {
 		name        string
 		nodesConfig string
 		assetsDir   string
-		outputName  string
 
 		objects          func(string, string) []runtime.Object
 		remoteExecOutput string
 
-		expectedOutputImage string
-		expectedError       string
+		expectedError string
+		expectedPod   func(t *testing.T, pod *corev1.Pod)
 	}{
 		{
 			name:        "default",
 			nodesConfig: defaultNodesConfigYaml,
 			objects:     defaultClusterVersionObjectFn,
-		},
-		{
-			name:                "command with options",
-			nodesConfig:         defaultNodesConfigYaml,
-			objects:             defaultClusterVersionObjectFn,
-			assetsDir:           "/my-working-dir",
-			outputName:          "node.iso",
-			expectedOutputImage: "/my-working-dir/node.iso",
+			assetsDir:   "/my-working-dir",
 		},
 		{
 			name:             "node-joiner tool failure",
@@ -169,6 +149,47 @@ func TestRun(t *testing.T) {
 			name:          "missing cluster connection",
 			nodesConfig:   defaultNodesConfigYaml,
 			expectedError: `command expects a connection to an OpenShift 4.x server`,
+		},
+		{
+			name:        "use proxy settings when defined",
+			nodesConfig: defaultNodesConfigYaml,
+			objects: func(repo, manifestDigest string) []runtime.Object {
+				objs := defaultClusterVersionObjectFn(repo, manifestDigest)
+				return append(objs, &configv1.Proxy{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "cluster",
+					},
+					Status: configv1.ProxyStatus{
+						HTTPProxy:  "http://192.168.111.1:8215",
+						HTTPSProxy: "https://192.168.111.1:8215",
+						NoProxy:    "172.22.0.0/24,192.168.111.0/24,localhost",
+					},
+				})
+			},
+			expectedPod: func(t *testing.T, pod *corev1.Pod) {
+				for _, expectedVar := range []struct {
+					name  string
+					value string
+				}{
+					{name: "HTTP_PROXY", value: "http://192.168.111.1:8215"},
+					{name: "HTTPS_PROXY", value: "https://192.168.111.1:8215"},
+					{name: "NO_PROXY", value: "172.22.0.0/24,192.168.111.0/24,localhost"},
+				} {
+					varFound := false
+					for _, e := range pod.Spec.Containers[0].Env {
+						if e.Name == expectedVar.name {
+							if e.Value != expectedVar.value {
+								t.Errorf("expected pod env var '%s' value '%s', but found '%s'", expectedVar.name, expectedVar.value, e.Value)
+							}
+							varFound = true
+							break
+						}
+					}
+					if !varFound {
+						t.Errorf("expected pod env var '%s' not found", expectedVar.name)
+					}
+				}
+			},
 		},
 	}
 	for _, tc := range testCases {
@@ -211,8 +232,7 @@ func TestRun(t *testing.T) {
 					return fakeCp
 				},
 
-				AssetsDir:  tc.assetsDir,
-				OutputName: tc.outputName,
+				AssetsDir: tc.assetsDir,
 			}
 			// Since the fake registry creates a self-signed cert, let's configure
 			// the command options accordingly
@@ -221,9 +241,15 @@ func TestRun(t *testing.T) {
 			err := o.Run()
 			assertContainerImageAndErrors(t, err, fakeReg, fakeClient, tc.expectedError, nodeJoinerContainer)
 
+			// Perform additional checks on the generated node-joiner pod
+			if tc.expectedPod != nil {
+				pod := getTestPod(fakeClient, nodeJoinerContainer)
+				tc.expectedPod(t, pod)
+			}
+
 			if tc.expectedError == "" {
-				if fakeCp.options.Destination.Path != tc.expectedOutputImage {
-					t.Errorf("expected %v, actual %v", tc.expectedOutputImage, fakeCp.options.Destination.Path)
+				if fakeCp.options.Destination.Path != tc.assetsDir {
+					t.Errorf("expected %v, actual %v", fakeCp.options.Destination.Path, tc.assetsDir)
 				}
 			}
 		})
@@ -495,12 +521,17 @@ var defaultClusterVersionObjectFn = func(repo string, manifestDigest string) []r
 	}
 }
 
+func getTestPod(fakeClient *fake.Clientset, podName string) *corev1.Pod {
+	pod, _ := fakeClient.CoreV1().Pods("").Get(context.Background(), podName, metav1.GetOptions{})
+	return pod
+}
+
 func assertContainerImageAndErrors(t *testing.T, runErr error, fakeReg *fakeRegistry, fakeClient *fake.Clientset, expectedError, podName string) {
 	if expectedError == "" {
 		if runErr != nil {
 			t.Fatalf("unexpected error: %v", runErr)
 		}
-		pod, _ := fakeClient.CoreV1().Pods("").Get(context.Background(), podName, metav1.GetOptions{})
+		pod := getTestPod(fakeClient, podName)
 		// In case of success, let's verify that the image pullspec used was effectively the one served by the
 		// fake registry.
 		if fakeReg.baremetalInstallerPullSpec != pod.Spec.Containers[0].Image {

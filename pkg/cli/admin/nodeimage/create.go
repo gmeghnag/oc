@@ -8,7 +8,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
-	"path"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -71,11 +71,11 @@ var (
 		cluster release.
 
 		A nodes-config.yaml config file must be created to provide the required
-		initial configuration for the selected nodes. 
+		initial configuration for the selected nodes.
 		Alternatively, to support simpler configurations for adding just a single
 		node, it's also possible to use a set of flags to configure the host. In
 		such case the '--mac-address' is the only mandatory flag - while all the
-		others will be optional (note: any eventual configuration file present 
+		others will be optional (note: any eventual configuration file present
 		will be ignored).
 	`)
 
@@ -87,7 +87,7 @@ var (
 		  oc adm node-image create --dir=/tmp/assets
 
 		# Specify a custom image name
-		  oc adm node-image create --o=my-node.iso
+		  oc adm node-image create -o=my-node.iso
 
 		# Create an ISO to add a single node without using the configuration file
 		  oc adm node-image create --mac-address=00:d8:e7:c7:4b:bb
@@ -161,7 +161,7 @@ func (o *CreateOptions) AddFlags(cmd *cobra.Command) {
 	flags := o.addBaseFlags(cmd)
 
 	flags.StringVar(&o.AssetsDir, "dir", o.AssetsDir, "The path containing the configuration file, used also to store the generated artifacts.")
-	flags.StringVarP(&o.OutputName, "output-name", "o", "node.iso", "The name of the output image.")
+	flags.StringVarP(&o.OutputName, "output-name", "o", "", "The name of the output image.")
 
 	flags.StringP(snFlagMacAddress, "m", "", "Single node flag. MAC address used to identify the host to apply the configuration. If specified, the nodes-config.yaml config file will not be used.")
 	usageFmt := "Single node flag. %s. Valid only when `mac-address` is defined."
@@ -244,10 +244,6 @@ func (o *CreateOptions) Validate() error {
 		}
 	}
 
-	if o.OutputName == "" {
-		return fmt.Errorf("--output-name cannot be empty")
-	}
-
 	return nil
 }
 
@@ -308,6 +304,12 @@ func (o *CreateOptions) Run() error {
 	if err != nil {
 		return err
 	}
+
+	err = o.renameImageIfOutputNameIsSpecified()
+	if err != nil {
+		return err
+	}
+
 	klog.V(1).Info("Command successfully completed")
 	return nil
 }
@@ -331,18 +333,64 @@ func (o *CreateOptions) copyArtifactsFromNodeJoinerPod() error {
 	klog.V(2).Infof("Copying artifacts from %s", o.nodeJoinerPod.GetName())
 	rsyncOptions := &rsync.RsyncOptions{
 		Namespace:     o.nodeJoinerNamespace.GetName(),
-		Source:        &rsync.PathSpec{PodName: o.nodeJoinerPod.GetName(), Path: path.Join("/assets", "node.x86_64.iso")},
+		Source:        &rsync.PathSpec{PodName: o.nodeJoinerPod.GetName(), Path: "/assets/"},
 		ContainerName: nodeJoinerContainer,
-		Destination:   &rsync.PathSpec{PodName: "", Path: path.Join(o.AssetsDir, o.OutputName)},
+		Destination:   &rsync.PathSpec{PodName: "", Path: o.AssetsDir},
 		Client:        o.Client,
 		Config:        o.Config,
 		Compress:      true,
 		RshCmd:        fmt.Sprintf("%s --namespace=%s -c %s", o.rsyncRshCmd, o.nodeJoinerNamespace.GetName(), nodeJoinerContainer),
 		IOStreams:     o.IOStreams,
 		Quiet:         true,
+		RsyncInclude:  []string{"*.iso"},
+		RsyncExclude:  []string{"*"},
 	}
 	rsyncOptions.Strategy = o.copyStrategy(rsyncOptions)
 	return rsyncOptions.RunRsync()
+}
+
+func (o *CreateOptions) renameImageIfOutputNameIsSpecified() error {
+	if o.OutputName == "" {
+		return nil
+	}
+	// AssetDir doesn't exist in unit test fake filesystem
+	_, err := os.Stat(o.AssetsDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		} else {
+			return err
+		}
+	}
+
+	err = filepath.Walk(o.AssetsDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		if !info.IsDir() && info.Name() != o.OutputName && strings.HasSuffix(info.Name(), ".iso") {
+			newPath := filepath.Join(filepath.Dir(path), o.OutputName)
+
+			// Check if another file has the same name
+			if _, err := os.Stat(newPath); err == nil {
+				return fmt.Errorf("file already exists: %s", newPath)
+			}
+
+			err := os.Rename(path, newPath)
+			if err != nil {
+				return err
+			} else {
+				return nil
+			}
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 func (o *CreateOptions) waitForCompletion(ctx context.Context) error {
@@ -555,12 +603,44 @@ func (o *CreateOptions) createPod(ctx context.Context) error {
 			},
 		},
 	}
+
+	err := o.configurePodProxySetting(ctx, nodeJoinerPod)
+	if err != nil {
+		return err
+	}
+
 	pod, err := o.Client.CoreV1().Pods(o.nodeJoinerNamespace.GetName()).Create(ctx, nodeJoinerPod, metav1.CreateOptions{})
 	if err != nil {
 		return fmt.Errorf("cannot create pod: %w", err)
 	}
 	o.nodeJoinerPod = pod
 
+	return nil
+}
+
+func (o *CreateOptions) configurePodProxySetting(ctx context.Context, pod *corev1.Pod) error {
+	proxy, err := o.ConfigClient.ConfigV1().Proxies().Get(ctx, "cluster", metav1.GetOptions{})
+	if err != nil {
+		if kapierrors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+
+	proxyVars := []corev1.EnvVar{}
+	if proxy.Status.HTTPProxy != "" {
+		proxyVars = append(proxyVars, corev1.EnvVar{Name: "HTTP_PROXY", Value: proxy.Status.HTTPProxy})
+	}
+	if proxy.Status.HTTPSProxy != "" {
+		proxyVars = append(proxyVars, corev1.EnvVar{Name: "HTTPS_PROXY", Value: proxy.Status.HTTPSProxy})
+	}
+	if proxy.Status.NoProxy != "" {
+		proxyVars = append(proxyVars, corev1.EnvVar{Name: "NO_PROXY", Value: proxy.Status.NoProxy})
+	}
+
+	for i := range pod.Spec.Containers {
+		pod.Spec.Containers[i].Env = append(pod.Spec.Containers[i].Env, proxyVars...)
+	}
 	return nil
 }
 
@@ -772,9 +852,24 @@ func (c *BaseNodeImageCommand) createRolesAndBindings(ctx context.Context) error
 					"clusterversions",
 					"infrastructures",
 					"proxies",
+					"imagedigestmirrorsets",
+					"imagecontentpolicies",
 				},
 				Verbs: []string{
 					"get",
+					"list",
+				},
+			},
+			{
+				APIGroups: []string{
+					"machineconfiguration.openshift.io",
+				},
+				Resources: []string{
+					"machineconfigs",
+				},
+				Verbs: []string{
+					"get",
+					"list",
 				},
 			},
 			{

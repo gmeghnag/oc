@@ -41,7 +41,6 @@ import (
 	"k8s.io/kubectl/pkg/scheme"
 	"k8s.io/kubectl/pkg/util/interrupt"
 	"k8s.io/kubectl/pkg/util/templates"
-	"k8s.io/kubectl/pkg/util/term"
 	"k8s.io/pod-security-admission/api"
 
 	appsv1 "github.com/openshift/api/apps/v1"
@@ -302,7 +301,7 @@ func (o *DebugOptions) Complete(cmd *cobra.Command, f kcmdutil.Factory, args []s
 		o.Attach.TTY = false
 		o.Attach.Stdin = false
 	default:
-		o.Attach.TTY = term.IsTerminal(o.In)
+		o.Attach.TTY = printers.IsTerminal(o.In)
 		klog.V(4).Infof("Defaulting TTY to %t", o.Attach.TTY)
 	}
 	if o.NoStdin {
@@ -1090,6 +1089,11 @@ func (o *DebugOptions) approximatePodTemplateForObject(object runtime.Object) (*
 								// Set the Shell variable to auto-logout after 15m idle timeout
 								Name:  "TMOUT",
 								Value: "900",
+							},
+							{
+								//  to collect more sos report requires this env var is set
+								Name:  "HOST",
+								Value: "/host",
 							},
 						},
 					},
