@@ -17,6 +17,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/cli-runtime/pkg/genericiooptions"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/transport"
 	"k8s.io/klog/v2"
@@ -57,6 +58,9 @@ type options struct {
 	Namespace     string
 	InsecureTLS   bool
 	allNamespaces bool
+	ClientConfig  *rest.Config
+	ClientSet     kubernetes.Interface
+	BearerToken   string
 }
 
 func newOptions(streams genericiooptions.IOStreams) *options {
@@ -101,6 +105,15 @@ func (o *options) Complete(f kcmdutil.Factory, cmd *cobra.Command, args []string
 	if err != nil {
 		return err
 	}
+	o.ClientConfig, err = f.ToRESTConfig()
+	if err != nil {
+		return err
+	}
+
+	o.ClientSet, err = kubernetes.NewForConfig(o.ClientConfig)
+	if err != nil {
+		return err
+	}
 	o.getRoute = func(ctx context.Context, namespace string, name string, opts metav1.GetOptions) (*routev1.Route, error) {
 		return routeClient.Routes(namespace).Get(ctx, name, opts)
 	}
@@ -134,7 +147,23 @@ func (v persistentVolumeClaimInfo) PrintLine(out io.Writer) {
 }
 
 func (o *options) Run(ctx context.Context, args []string) error {
-	persistentVolumeClaimsBytes, err := GetPersistentVolumeClaims(ctx, o.getRoute, o.RESTConfig.BearerToken, o.Namespace, o.InsecureTLS, args)
+	o.BearerToken = o.RESTConfig.BearerToken
+	if len(o.RESTConfig.BearerToken) == 0 {
+		klog.V(4).Info("no token is currently in use for this session")
+		klog.V(5).Info("attempting to retrieve token from secret \"localhost-recovery-client-token\" in namespace \"openshift-kube-apiserver\"")
+		secret, err := o.ClientSet.CoreV1().Secrets("openshift-kube-apiserver").Get(context.TODO(), "localhost-recovery-client-token", metav1.GetOptions{})
+		if err != nil {
+			klog.V(4).Info(fmt.Errorf("error retrieving secret: %s", err.Error()))
+			return fmt.Errorf("no token is currently in use for this session")
+		}
+		localhostRecoveryToken, exist := secret.Data["token"]
+		if !exist {
+			klog.V(4).Info(fmt.Errorf("\"token\" key not found in secret \"localhost-recovery-client-token\" in namespace \"openshift-kube-apiserver\""))
+			return fmt.Errorf("no token is currently in use for this session")
+		}
+		o.BearerToken = string(localhostRecoveryToken)
+	}
+	persistentVolumeClaimsBytes, err := GetPersistentVolumeClaims(ctx, o.getRoute, o.BearerToken, o.Namespace, o.InsecureTLS, args)
 	if err != nil {
 		return err
 	}
@@ -143,6 +172,7 @@ func (o *options) Run(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+
 	if len(promOutput.Data.Result) == 0 {
 		if o.Namespace == "" {
 			return fmt.Errorf("no persistentvolumeclaims found.")
@@ -159,7 +189,7 @@ func (o *options) Run(ctx context.Context, args []string) error {
 	if len(args) != 0 && len(promOutput.Data.Result) != len(args) {
 		resultingPvc := make(map[string]bool)
 		for _, _promOutputDataResult := range promOutput.Data.Result {
-			pvcName, _ := _promOutputDataResult.Metric["persistentvolumeclaim"]
+			pvcName := _promOutputDataResult.Metric["persistentvolumeclaim"]
 			resultingPvc[pvcName] = true
 		}
 		for _, arg := range args {
@@ -173,8 +203,8 @@ func (o *options) Run(ctx context.Context, args []string) error {
 	headers := []string{"NAMESPACE", "NAME", "USAGE(%)"}
 	infos := []Info{}
 	for _, _promOutputDataResult := range promOutput.Data.Result {
-		namespaceName, _ := _promOutputDataResult.Metric["namespace"]
-		pvcName, _ := _promOutputDataResult.Metric["persistentvolumeclaim"]
+		namespaceName := _promOutputDataResult.Metric["namespace"]
+		pvcName := _promOutputDataResult.Metric["persistentvolumeclaim"]
 		usagePercentage := _promOutputDataResult.Value[1]
 		valueFloatLong, _ := strconv.ParseFloat(usagePercentage.(string), 64)
 		valueFloat := fmt.Sprintf("%.2f", valueFloatLong)
@@ -206,7 +236,8 @@ func GetPersistentVolumeClaims(ctx context.Context, getRoute RouteGetter, bearer
 
 	persistentVolumeClaimsBytes, err := getWithBearer(ctx, getRoute, "openshift-monitoring", "prometheus-k8s", uri, bearerToken, insecureTLS)
 	if err != nil {
-		return persistentVolumeClaimsBytes, fmt.Errorf("failed to get persistentvolumeclaims from Prometheus: %w", err)
+		klog.V(4).Info(fmt.Errorf("failed to get persistentvolumeclaims from Prometheus: %w", err))
+		return persistentVolumeClaimsBytes, fmt.Errorf("metrics not available yet")
 	}
 
 	return persistentVolumeClaimsBytes, nil
