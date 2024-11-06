@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -115,28 +116,40 @@ func TestRun(t *testing.T) {
 	}
 
 	testCases := []struct {
-		name        string
-		nodesConfig string
-		assetsDir   string
+		name             string
+		nodesConfig      string
+		assetsDir        string
+		generatePXEFiles bool
 
 		objects          func(string, string) []runtime.Object
 		remoteExecOutput string
 
-		expectedError string
-		expectedPod   func(t *testing.T, pod *corev1.Pod)
+		expectedError        string
+		expectedPod          func(t *testing.T, pod *corev1.Pod)
+		expectedRsyncInclude string
 	}{
 		{
-			name:        "default",
-			nodesConfig: defaultNodesConfigYaml,
-			objects:     defaultClusterVersionObjectFn,
-			assetsDir:   "/my-working-dir",
+			name:                 "default",
+			nodesConfig:          defaultNodesConfigYaml,
+			objects:              defaultClusterVersionObjectFn,
+			assetsDir:            "/my-working-dir",
+			generatePXEFiles:     false,
+			expectedRsyncInclude: "*.iso",
+		},
+		{
+			name:                 "default pxe",
+			nodesConfig:          defaultNodesConfigYaml,
+			objects:              defaultClusterVersionObjectFn,
+			assetsDir:            "/my-working-dir",
+			generatePXEFiles:     true,
+			expectedRsyncInclude: "boot-artifacts/*",
 		},
 		{
 			name:             "node-joiner tool failure",
 			nodesConfig:      defaultNodesConfigYaml,
 			objects:          defaultClusterVersionObjectFn,
 			remoteExecOutput: "1",
-			expectedError:    `image generation error (exit code: 1)`,
+			expectedError:    `image generation error: <nil> (exit code: 1)`,
 		},
 		{
 			name:             "node-joiner unsupported prior to 4.17",
@@ -232,7 +245,8 @@ func TestRun(t *testing.T) {
 					return fakeCp
 				},
 
-				AssetsDir: tc.assetsDir,
+				AssetsDir:        tc.assetsDir,
+				GeneratePXEFiles: tc.generatePXEFiles,
 			}
 			// Since the fake registry creates a self-signed cert, let's configure
 			// the command options accordingly
@@ -250,6 +264,12 @@ func TestRun(t *testing.T) {
 			if tc.expectedError == "" {
 				if fakeCp.options.Destination.Path != tc.assetsDir {
 					t.Errorf("expected %v, actual %v", fakeCp.options.Destination.Path, tc.assetsDir)
+				}
+			}
+
+			if tc.expectedRsyncInclude != "" {
+				if !slices.Contains(fakeCp.options.RsyncInclude, tc.expectedRsyncInclude) {
+					t.Errorf("expected RSyncOptions to include %v, but doesn't", tc.expectedRsyncInclude)
 				}
 			}
 		})
