@@ -201,6 +201,7 @@ func (o *options) Run(ctx context.Context, args []string) error {
 
 	}
 	headers := []string{"NAMESPACE", "NAME", "USAGE(%)"}
+	pvcInfos := []persistentVolumeClaimInfo{}
 	infos := []Info{}
 	for _, _promOutputDataResult := range promOutput.Data.Result {
 		namespaceName := _promOutputDataResult.Metric["namespace"]
@@ -208,9 +209,17 @@ func (o *options) Run(ctx context.Context, args []string) error {
 		usagePercentage := _promOutputDataResult.Value[1]
 		valueFloatLong, _ := strconv.ParseFloat(usagePercentage.(string), 64)
 		valueFloat := fmt.Sprintf("%.2f", valueFloatLong)
-		infos = append(infos, persistentVolumeClaimInfo{Namespace: namespaceName, Name: pvcName, UsagePercentage: valueFloat})
-
+		if len(pvcInfos) > 0 {
+			if !(namespaceName == pvcInfos[len(pvcInfos)-1].Namespace && pvcName == pvcInfos[len(pvcInfos)-1].Name) {
+				pvcInfos = append(pvcInfos, persistentVolumeClaimInfo{Namespace: namespaceName, Name: pvcName, UsagePercentage: valueFloat})
+				infos = append(infos, persistentVolumeClaimInfo{Namespace: namespaceName, Name: pvcName, UsagePercentage: valueFloat})
+			}
+		} else {
+			pvcInfos = append(pvcInfos, persistentVolumeClaimInfo{Namespace: namespaceName, Name: pvcName, UsagePercentage: valueFloat})
+			infos = append(infos, persistentVolumeClaimInfo{Namespace: namespaceName, Name: pvcName, UsagePercentage: valueFloat})
+		}
 	}
+
 	Print(o.Out, headers, infos)
 	return nil
 }
