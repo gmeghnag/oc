@@ -146,10 +146,6 @@ func (o *options) Run(ctx context.Context) error {
 		fmt.Fprintf(o.ErrOut, "warning: Cannot refresh available updates:\n  Reason: %s\n  Message: %s\n\n", c.Reason, strings.ReplaceAll(c.Message, "\n", "\n  "))
 	}
 
-	if c := findClusterOperatorStatusCondition(cv.Status.Conditions, configv1.OperatorUpgradeable); c != nil && c.Status == configv1.ConditionFalse {
-		fmt.Fprintf(o.Out, "%s=%s\n\n  Reason: %s\n  Message: %s\n\n", c.Type, c.Status, c.Reason, strings.ReplaceAll(c.Message, "\n", "\n  "))
-	}
-
 	if cv.Spec.Channel != "" {
 		if cv.Spec.Upstream == "" {
 			fmt.Fprint(o.Out, "Upstream is unset, so the cluster will use an appropriate default.\n")
@@ -206,6 +202,12 @@ func (o *options) Run(ctx context.Context) error {
 		})
 	}
 
+	if c := findClusterOperatorStatusCondition(cv.Status.Conditions, configv1.OperatorUpgradeable); c != nil && c.Status == configv1.ConditionFalse {
+		if err := injectUpgradeableAsCondition(cv.Status.Desired.Version, c, majorMinorBuckets); err != nil {
+			fmt.Fprintf(o.ErrOut, "warning: Cannot inject %s=%s as a conditional update risk: %s\n\nReason: %s\n  Message: %s\n\n", c.Type, c.Status, err, c.Reason, strings.ReplaceAll(c.Message, "\n", "\n  "))
+		}
+	}
+
 	if o.version != nil {
 		if len(majorMinorBuckets) == 0 {
 			return fmt.Errorf("no updates available, so cannot display context for the requested release %s", o.version)
@@ -220,14 +222,14 @@ func (o *options) Run(ctx context.Context) error {
 				if update.Release.Version == o.version.String() {
 					fmt.Fprintln(o.Out)
 					if c := notRecommendedCondition(update); c == nil {
-						fmt.Fprintf(o.Out, "Update to %s has no known issues relevant to this cluster.\nImage: %s\nURL: %s\n", update.Release.Version, update.Release.Image, update.Release.URL)
+						fmt.Fprintf(o.Out, "Update to %s has no known issues relevant to this cluster.\nImage: %s\nRelease URL: %s\n", update.Release.Version, update.Release.Image, update.Release.URL)
 					} else {
-						fmt.Fprintf(o.Out, "Update to %s %s=%s:\nImage: %s\nURL: %s\nReason: %s\nMessage: %s\n", update.Release.Version, c.Type, c.Status, update.Release.Image, update.Release.URL, c.Reason, strings.ReplaceAll(c.Message, "\n", "\n  "))
+						fmt.Fprintf(o.Out, "Update to %s %s=%s:\nImage: %s\nRelease URL: %s\nReason: %s\nMessage: %s\n", update.Release.Version, c.Type, c.Status, update.Release.Image, update.Release.URL, c.Reason, strings.ReplaceAll(c.Message, "\n", "\n  "))
 					}
 					return nil
 				}
 			}
-			return fmt.Errorf("no updates to %d.%d available, so cannot display context for the requested release %s", o.version.Major, o.version.Minor, o.version)
+			return fmt.Errorf("no update to %s available, so cannot display context for the requested release", o.version)
 		}
 	}
 
@@ -279,7 +281,7 @@ func (o *options) Run(ctx context.Context) error {
 					break
 				}
 				if c == nil {
-					fmt.Fprintf(w, "  %s\t\n", update.Release.Version)
+					fmt.Fprintf(w, "  %s\t%s\n", update.Release.Version, "no known issues relevant to this cluster")
 					if !o.showOutdatedReleases {
 						headerQueued = false
 						w.Flush()
@@ -359,4 +361,78 @@ func findClusterOperatorStatusCondition(conditions []configv1.ClusterOperatorSta
 		}
 	}
 	return nil
+}
+
+func injectUpgradeableAsCondition(version string, condition *configv1.ClusterOperatorStatusCondition, majorMinorBuckets map[uint64]map[uint64][]configv1.ConditionalUpdate) error {
+	current, err := semver.Parse(version)
+	if err != nil {
+		return fmt.Errorf("cannot parse SemVer version %q: %v", version, err)
+	}
+
+	upgradeableURI := fmt.Sprintf("https://docs.openshift.com/container-platform/%d.%d/updating/preparing_for_updates/updating-cluster-prepare.html#cluster-upgradeable_updating-cluster-prepare", current.Major, current.Minor)
+	if current.Minor <= 13 {
+		upgradeableURI = fmt.Sprintf("https://docs.openshift.com/container-platform/%d.%d/updating/index.html#understanding_clusteroperator_conditiontypes_updating-clusters-overview", current.Major, current.Minor)
+	}
+
+	for major, minors := range majorMinorBuckets {
+		if major < current.Major {
+			continue
+		}
+
+		for minor, targets := range minors {
+			if major == current.Major && minor <= current.Minor {
+				continue
+			}
+
+			for i := 0; i < len(targets); i++ {
+				majorMinorBuckets[major][minor][i] = ensureUpgradeableRisk(majorMinorBuckets[major][minor][i], condition, upgradeableURI)
+			}
+		}
+	}
+
+	return nil
+}
+
+func ensureUpgradeableRisk(target configv1.ConditionalUpdate, condition *configv1.ClusterOperatorStatusCondition, upgradeableURI string) configv1.ConditionalUpdate {
+	if hasUpgradeableRisk(target, condition) {
+		return target
+	}
+
+	target.Risks = append(target.Risks, configv1.ConditionalUpdateRisk{
+		URL:           upgradeableURI,
+		Name:          "UpgradeableFalse",
+		Message:       condition.Message,
+		MatchingRules: []configv1.ClusterCondition{{Type: "Always"}},
+	})
+
+	for i, c := range target.Conditions {
+		if c.Type == "Recommended" {
+			if c.Status == metav1.ConditionTrue {
+				target.Conditions[i].Reason = condition.Reason
+				target.Conditions[i].Message = condition.Message
+			} else {
+				target.Conditions[i].Reason = "MultipleReasons"
+				target.Conditions[i].Message = fmt.Sprintf("%s\n\n%s", condition.Message, c.Message)
+			}
+			target.Conditions[i].Status = metav1.ConditionFalse
+			return target
+		}
+	}
+
+	target.Conditions = append(target.Conditions, metav1.Condition{
+		Type:    "Recommended",
+		Status:  metav1.ConditionFalse,
+		Reason:  condition.Reason,
+		Message: condition.Message,
+	})
+	return target
+}
+
+func hasUpgradeableRisk(target configv1.ConditionalUpdate, condition *configv1.ClusterOperatorStatusCondition) bool {
+	for _, risk := range target.Risks {
+		if strings.Contains(risk.Message, condition.Message) {
+			return true
+		}
+	}
+	return false
 }

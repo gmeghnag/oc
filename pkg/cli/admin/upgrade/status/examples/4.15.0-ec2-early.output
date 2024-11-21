@@ -1,6 +1,7 @@
 = Control Plane =
 Assessment:      Progressing
 Target Version:  4.15.0-ec.2 (from incomplete 4.14.1)
+Updating:        etcd, kube-apiserver
 Completion:      3% (1 operators updated, 2 updating, 30 waiting)
 Duration:        1m29s (Est. Time Remaining: 1h25m)
 Operator Health: 33 Healthy
@@ -14,7 +15,7 @@ ip-10-0-92-180.us-east-2.compute.internal   Outdated     Pending   4.14.1    ?
 = Worker Upgrade =
 
 WORKER POOL   ASSESSMENT   COMPLETION   STATUS
-worker        Pending      0%           3 Total, 3 Available, 0 Progressing, 3 Outdated, 0 Draining, 0 Excluded, 0 Degraded
+worker        Pending      0% (0/3)     3 Available, 0 Progressing, 0 Draining
 
 Worker Pool Nodes: worker
 NAME                                        ASSESSMENT   PHASE     VERSION   EST   MESSAGE
