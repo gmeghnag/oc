@@ -14,8 +14,9 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/errors"
+	errorsutil "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/cli-runtime/pkg/genericiooptions"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -28,9 +29,14 @@ import (
 	routev1client "github.com/openshift/client-go/route/clientset/versioned/typed/route/v1"
 )
 
+const (
+	localhostRecoveryTokenSecret = "localhost-recovery-client-token"
+	kubeApiserverNamespace       = "openshift-kube-apiserver"
+)
+
 var (
 	topPersistentVolumeClaimsLong = templates.LongDesc(`
-		Show usage statistics for bound persistentvolumeclaims.
+		Experimental: Show usage statistics for bound persistentvolumeclaims.
 
 		This command analyzes all the bound persistentvolumeclaims managed by the platform and presents current usage statistics.
 	`)
@@ -53,7 +59,6 @@ type RouteGetter func(ctx context.Context, namespace string, name string, opts m
 
 type options struct {
 	genericiooptions.IOStreams
-	RESTConfig    *rest.Config
 	getRoute      RouteGetter
 	Namespace     string
 	InsecureTLS   bool
@@ -74,7 +79,7 @@ func NewCmdTopPersistentVolumeClaims(f kcmdutil.Factory, streams genericiooption
 	cmd := &cobra.Command{
 		Use:     "persistentvolumeclaims",
 		Aliases: []string{"persistentvolumeclaim", "pvc"},
-		Short:   "Show usage statistics for bound persistentvolumeclaims",
+		Short:   "Experimental: Show usage statistics for bound persistentvolumeclaims",
 		Long:    topPersistentVolumeClaimsLong,
 		Example: topPersistentVolumeClaimsExample,
 		Run: func(cmd *cobra.Command, args []string) {
@@ -85,6 +90,7 @@ func NewCmdTopPersistentVolumeClaims(f kcmdutil.Factory, streams genericiooption
 
 	cmd.Flags().BoolVarP(&o.allNamespaces, "all-namespaces", "A", o.allNamespaces, "If present, list the pvc usage across all namespaces. Namespace in current context is ignored even if specified with --namespace")
 	cmd.Flags().BoolVar(&o.InsecureTLS, "insecure-skip-tls-verify", false, "If true, the server's certificate will not be checked for validity. This will make your HTTPS connections insecure")
+	cmd.Flags().MarkHidden("insecure-skip-tls-verify")
 	return cmd
 }
 
@@ -99,13 +105,9 @@ func (o *options) Complete(f kcmdutil.Factory, cmd *cobra.Command, args []string
 		return err
 	}
 
-	o.RESTConfig = cfg
+	o.ClientConfig = cfg
 
 	routeClient, err := routev1client.NewForConfig(cfg)
-	if err != nil {
-		return err
-	}
-	o.ClientConfig, err = f.ToRESTConfig()
 	if err != nil {
 		return err
 	}
@@ -147,19 +149,20 @@ func (v persistentVolumeClaimInfo) PrintLine(out io.Writer) {
 }
 
 func (o *options) Run(ctx context.Context, args []string) error {
-	o.BearerToken = o.RESTConfig.BearerToken
-	if len(o.RESTConfig.BearerToken) == 0 {
-		klog.V(4).Info("no token is currently in use for this session")
-		klog.V(5).Info("attempting to retrieve token from secret \"localhost-recovery-client-token\" in namespace \"openshift-kube-apiserver\"")
-		secret, err := o.ClientSet.CoreV1().Secrets("openshift-kube-apiserver").Get(context.TODO(), "localhost-recovery-client-token", metav1.GetOptions{})
+	o.BearerToken = o.ClientConfig.BearerToken
+	if len(o.ClientConfig.BearerToken) == 0 {
+		klog.V(4).Info(fmt.Sprintf(`no token is currently in use for this session, attempting to retrieve token from secret "%s" in namespace "%s"`, localhostRecoveryTokenSecret, kubeApiserverNamespace))
+		secret, err := o.ClientSet.CoreV1().Secrets(kubeApiserverNamespace).Get(context.TODO(), localhostRecoveryTokenSecret, metav1.GetOptions{})
 		if err != nil {
-			klog.V(4).Info(fmt.Errorf("error retrieving secret: %s", err.Error()))
-			return fmt.Errorf("no token is currently in use for this session")
+			if errors.IsNotFound(err) {
+				klog.V(4).Info(fmt.Errorf("error retrieving secret: %s", err.Error()))
+				return fmt.Errorf("no token is currently in use for this session")
+			}
+			return fmt.Errorf("%s", err.Error())
 		}
 		localhostRecoveryToken, exist := secret.Data["token"]
 		if !exist {
-			klog.V(4).Info(fmt.Errorf("\"token\" key not found in secret \"localhost-recovery-client-token\" in namespace \"openshift-kube-apiserver\""))
-			return fmt.Errorf("no token is currently in use for this session")
+			return fmt.Errorf(`"token" key not found in secret "%s" in namespace "%s"`, localhostRecoveryTokenSecret, kubeApiserverNamespace)
 		}
 		o.BearerToken = string(localhostRecoveryToken)
 	}
@@ -176,25 +179,23 @@ func (o *options) Run(ctx context.Context, args []string) error {
 	if len(promOutput.Data.Result) == 0 {
 		if o.Namespace == "" {
 			return fmt.Errorf("no persistentvolumeclaims found.")
-		} else {
-			if len(args) == 0 {
-				return fmt.Errorf("no persistentvolumeclaims found in %s namespace.", o.Namespace)
-			} else {
-				return fmt.Errorf("persistentvolumeclaim %q not found in %s namespace.", args[0], o.Namespace)
-			}
 		}
+		if len(args) == 0 {
+			return fmt.Errorf("no persistentvolumeclaims found in %s namespace.", o.Namespace)
+		}
+		return fmt.Errorf("persistentvolumeclaim %q not found in %s namespace.", args[0], o.Namespace)
+
 	}
 
 	// if more pvc are requested as args but one of them does not not exist
 	if len(args) != 0 && len(promOutput.Data.Result) != len(args) {
 		resultingPvc := make(map[string]bool)
-		for _, _promOutputDataResult := range promOutput.Data.Result {
-			pvcName := _promOutputDataResult.Metric["persistentvolumeclaim"]
+		for _, promOutputDataResult := range promOutput.Data.Result {
+			pvcName := promOutputDataResult.Metric["persistentvolumeclaim"]
 			resultingPvc[pvcName] = true
 		}
 		for _, arg := range args {
-			_, pvcPresentInResult := resultingPvc[arg]
-			if !pvcPresentInResult {
+			if _, ok := resultingPvc[arg]; !ok {
 				return fmt.Errorf("persistentvolumeclaim %q not found in %s namespace.", arg, o.Namespace)
 			}
 		}
@@ -203,10 +204,10 @@ func (o *options) Run(ctx context.Context, args []string) error {
 	headers := []string{"NAMESPACE", "NAME", "USAGE(%)"}
 	pvcInfos := []persistentVolumeClaimInfo{}
 	infos := []Info{}
-	for _, _promOutputDataResult := range promOutput.Data.Result {
-		namespaceName := _promOutputDataResult.Metric["namespace"]
-		pvcName := _promOutputDataResult.Metric["persistentvolumeclaim"]
-		usagePercentage := _promOutputDataResult.Value[1]
+	for _, promOutputDataResult := range promOutput.Data.Result {
+		namespaceName := promOutputDataResult.Metric["namespace"]
+		pvcName := promOutputDataResult.Metric["persistentvolumeclaim"]
+		usagePercentage := promOutputDataResult.Value[1]
 		valueFloatLong, _ := strconv.ParseFloat(usagePercentage.(string), 64)
 		valueFloat := fmt.Sprintf("%.2f", valueFloatLong)
 		if len(pvcInfos) > 0 {
@@ -224,11 +225,7 @@ func (o *options) Run(ctx context.Context, args []string) error {
 	return nil
 }
 
-func GetPersistentVolumeClaims(ctx context.Context, getRoute RouteGetter, bearerToken string, namespace string, insecureTLS bool, args []string) ([]byte, error) {
-	uri := &url.URL{
-		Scheme: "https",
-		Path:   "/api/v1/query",
-	}
+func constructPrometheusQuery(namespace string, args []string) string {
 	query := ""
 	claimNames := ".*"
 	if namespace != "" {
@@ -239,14 +236,22 @@ func GetPersistentVolumeClaims(ctx context.Context, getRoute RouteGetter, bearer
 	} else {
 		query = `100*kubelet_volume_stats_used_bytes{persistentvolumeclaim=~".*"}/kubelet_volume_stats_capacity_bytes{persistentvolumeclaim=~".*"}`
 	}
+	return query
+}
+
+func GetPersistentVolumeClaims(ctx context.Context, getRoute RouteGetter, bearerToken string, namespace string, insecureTLS bool, args []string) ([]byte, error) {
+	uri := &url.URL{
+		Scheme: "https",
+		Path:   "/api/v1/query",
+	}
+	query := constructPrometheusQuery(namespace, args)
 	urlParams := url.Values{}
 	urlParams.Set("query", query)
 	uri.RawQuery = urlParams.Encode()
 
 	persistentVolumeClaimsBytes, err := getWithBearer(ctx, getRoute, "openshift-monitoring", "prometheus-k8s", uri, bearerToken, insecureTLS)
 	if err != nil {
-		klog.V(4).Info(fmt.Errorf("failed to get persistentvolumeclaims from Prometheus: %w", err))
-		return persistentVolumeClaimsBytes, fmt.Errorf("metrics not available yet")
+		return persistentVolumeClaimsBytes, fmt.Errorf("failed to get persistentvolumeclaims from Prometheus: %w", err)
 	}
 
 	return persistentVolumeClaimsBytes, nil
@@ -283,25 +288,23 @@ func getWithBearer(ctx context.Context, getRoute RouteGetter, namespace, name st
 	client := &http.Client{Transport: withDebugWrappers}
 	errs := make([]error, 0, len(route.Status.Ingress))
 	for _, ingress := range route.Status.Ingress {
-		uri := *baseURI
-		uri.Host = ingress.Host
-		content, err := checkedGet(uri, client)
+		baseURI.Host = ingress.Host
+		content, err := getMetrics(*baseURI, client)
 		if err == nil {
 			return content, nil
 		} else {
-			errs = append(errs, fmt.Errorf("%s->%w", ingress.Host, err))
+			errs = append(errs, fmt.Errorf("%s, %w", ingress.Host, err))
 		}
 	}
 
 	if len(errs) == 1 {
-		return nil, fmt.Errorf("unable to get %s from URI in the %s/%s Route: %s", baseURI.Path, namespace, name, errors.NewAggregate(errs))
-	} else {
-		return nil, fmt.Errorf("unable to get %s from any of %d URIs in the %s/%s Route: %s", baseURI.Path, len(errs), namespace, name, errors.NewAggregate(errs))
+		return nil, fmt.Errorf("unable to get %s from URI in the %s/%s Route: %s", baseURI.Path, namespace, name, errorsutil.NewAggregate(errs))
 	}
+	return nil, fmt.Errorf("unable to get %s from any of %d URIs in the %s/%s Route: %s", baseURI.Path, len(errs), namespace, name, errorsutil.NewAggregate(errs))
 
 }
 
-func checkedGet(uri url.URL, client *http.Client) ([]byte, error) {
+func getMetrics(uri url.URL, client *http.Client) ([]byte, error) {
 	req, err := http.NewRequest("GET", uri.String(), nil)
 	if err != nil {
 		return nil, err
